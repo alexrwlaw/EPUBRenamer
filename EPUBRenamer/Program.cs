@@ -12,8 +12,8 @@
 //   --out         Destination folder. Defaults to <inputFolder>\Renamed_<yyyyMMdd_HHmm>.
 //   --recursive   Include subdirectories when scanning for .epub files.
 //   --ascii       Strip diacritics to improve ASCII-only compatibility (Unicode kept by default).
-//   --titlecase   Apply smart Title Case to title and author parts (off by default).
-//   --authorformat Set author name formatting: as-is | firstlast | lastfirst (default: as-is).
+//   --titlecase   Apply smart Title Case to title and author parts (on by default).
+//   --authorformat Set author name formatting: as-is | firstlast | lastfirst (default: firstlast).
 //
 // Defaults:
 //   - Unicode preserved in filenames; punctuation normalized to safe characters.
@@ -397,8 +397,8 @@ internal static class EpubRenamerApp
         bool move = false;
         bool recursive = false;
         bool ascii = false; // Unicode by default
-        bool titleCase = false; // Off by default
-        AuthorFormat authorFormat = AuthorFormat.AsIs;
+        bool titleCase = true; // On by default
+        AuthorFormat authorFormat = AuthorFormat.FirstLast; // Default to First Last
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -514,6 +514,8 @@ internal static class EpubRenamerApp
         Console.WriteLine("  - Top-level search only (non-recursive).");
         Console.WriteLine("  - Copy to <input>\\Renamed_<yyyyMMdd_HHmm> unless --out is provided.");
         Console.WriteLine("  - Author joiner: comma \", \".");
+        Console.WriteLine("  - Title Case enabled (use --titlecase false to disable).");
+        Console.WriteLine("  - Author format: firstlast (use --authorformat as-is to disable).");
     }
 
     /// <summary>
