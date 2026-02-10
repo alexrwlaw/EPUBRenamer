@@ -1,12 +1,28 @@
-﻿// EPUBRenamer (Program.cs)
+// EPUBRenamer (Program.cs)
 // A console tool that proposes and applies safe, consistent filenames for .epub files
 // based on embedded metadata (Title, Authors). It previews changes by default and can
 // copy or move files to a separate output directory when --apply is specified.
 //
+// Inspect mode intent:
+//   This tool can also run in a report-only "inspection" mode to help you review a large
+//   library of EPUBs and identify which files likely warrant a closer look.
+//
+//   The goal is to flag EPUBs that appear to have been post-processed by common editing or
+//   conversion tools (for example, Calibre or Sigil) after the original publication package
+//   was created. Such post-processing is often well-intentioned, but it can introduce
+//   formatting quirks or non-publisher artifacts, and you may prefer to replace those EPUBs
+//   with higher-quality sources.
+//
+//   The inspection report is heuristic: it searches for known tool fingerprints inside the
+//   EPUB container (OPF/XHTML/CSS). A match suggests "this was likely modified," not that the
+//   content is necessarily wrong or unsafe.
+//
 // Usage:
 //   dotnet run -- <inputFolder> [--apply] [--move] [--out <outputFolder>] [--recursive] [--ascii [true|false]] [--titlecase [true|false]]
+//   dotnet run -- --inspect <folder> [--recursive]
 //
 // Options:
+//   --inspect     Inspect EPUBs and report tool fingerprints (report-only; incompatible with rename/apply options).
 //   --apply       Perform the operations (copy/move). Without this flag, runs as a preview.
 //   --move        Move files instead of copying (copy is the safer default).
 //   --out         Destination folder. Defaults to <inputFolder>\Renamed_<yyyyMMdd_HHmm>.
@@ -31,7 +47,10 @@
 //   - VersOne.Epub: reads EPUB 2/3 metadata (Title, Authors). This tool does not alter EPUB contents.
 
 using System.Globalization;
+using System.IO.Compression;
 using System.Text;
+using System.Text.RegularExpressions;
+using System.Xml.Linq;
 using VersOne.Epub;
 
 /// <summary>
@@ -82,6 +101,12 @@ internal static class EpubRenamerApp
         if (epubFiles.Count == 0)
         {
             Console.WriteLine("No .epub files found.");
+            return 0;
+        }
+
+        if (options.Inspect)
+        {
+            RunInspectionReport(epubFiles);
             return 0;
         }
 
@@ -392,6 +417,7 @@ internal static class EpubRenamerApp
         }
 
         string? inputDirectory = null;
+        string? inspectDirectory = null;
         string? outputDirectory = null;
         bool apply = false;
         bool move = false;
@@ -408,6 +434,14 @@ internal static class EpubRenamerApp
                 // Handle switches and flags with optional values
                 switch (arg)
                 {
+                    case "--inspect":
+                        if (i + 1 >= args.Length)
+                        {
+                            Console.Error.WriteLine("Missing value for --inspect");
+                            return null;
+                        }
+                        inspectDirectory = args[++i];
+                        break;
                     case "--apply":
                         apply = true;
                         break;
@@ -483,6 +517,23 @@ internal static class EpubRenamerApp
             }
         }
 
+        if (!string.IsNullOrWhiteSpace(inspectDirectory))
+        {
+            if (!string.IsNullOrWhiteSpace(inputDirectory))
+            {
+                Console.Error.WriteLine("Do not provide an input folder when using --inspect. Use: --inspect <folder>");
+                return null;
+            }
+            inputDirectory = inspectDirectory;
+
+            // Reject incompatible flags for inspect mode
+            if (apply || move || !string.IsNullOrWhiteSpace(outputDirectory) || ascii || !titleCase || authorFormat != AuthorFormat.FirstLast)
+            {
+                Console.Error.WriteLine("--inspect is report-only and cannot be combined with rename/apply options.");
+                return null;
+            }
+        }
+
         if (string.IsNullOrWhiteSpace(inputDirectory))
         {
             return null;
@@ -497,7 +548,8 @@ internal static class EpubRenamerApp
             Recursive = recursive,
             Ascii = ascii,
             TitleCase = titleCase,
-            AuthorFormat = authorFormat
+            AuthorFormat = authorFormat,
+            Inspect = !string.IsNullOrWhiteSpace(inspectDirectory)
         };
     }
 
@@ -508,6 +560,7 @@ internal static class EpubRenamerApp
     {
         Console.WriteLine("Usage:");
         Console.WriteLine("  dotnet run -- <inputFolder> [--apply] [--move] [--out <outputFolder>] [--recursive] [--ascii [true|false]] [--titlecase [true|false]] [--authorformat <as-is|firstlast|lastfirst>]");
+        Console.WriteLine("  dotnet run -- --inspect <folder> [--recursive]");
         Console.WriteLine();
         Console.WriteLine("Defaults:");
         Console.WriteLine("  - Unicode filenames (no ASCII stripping).");
@@ -516,6 +569,406 @@ internal static class EpubRenamerApp
         Console.WriteLine("  - Author joiner: comma \", \".");
         Console.WriteLine("  - Title Case enabled (use --titlecase false to disable).");
         Console.WriteLine("  - Author format: firstlast (use --authorformat as-is to disable).");
+    }
+
+    /// <summary>
+    /// A single fingerprint match found while inspecting an EPUB.
+    /// </summary>
+    private sealed class InspectionFinding
+    {
+        /// <summary>
+        /// The tool or family of tools suggested by the fingerprint (e.g., "Calibre", "Sigil").
+        /// </summary>
+        public string Tool { get; init; } = string.Empty;
+
+        /// <summary>
+        /// A relative weight used for scoring. Higher weights indicate stronger evidence.
+        /// </summary>
+        public int Weight { get; init; }
+
+        /// <summary>
+        /// Where the fingerprint was found (path inside the EPUB archive).
+        /// </summary>
+        public string Location { get; init; } = string.Empty;
+
+        /// <summary>
+        /// A short human-readable description of the evidence (token/attribute detected).
+        /// </summary>
+        public string Evidence { get; init; } = string.Empty;
+    }
+
+    /// <summary>
+    /// Summary of inspection results for a single EPUB file.
+    /// </summary>
+    private sealed class InspectionResult
+    {
+        /// <summary>
+        /// Full filesystem path to the EPUB.
+        /// </summary>
+        public string EpubPath { get; init; } = string.Empty;
+
+        /// <summary>
+        /// Sum of all finding weights. This is a heuristic score, not a probability.
+        /// </summary>
+        public int Score { get; init; }
+
+        /// <summary>
+        /// Individual evidence items discovered during inspection.
+        /// </summary>
+        public List<InspectionFinding> Findings { get; init; } = new();
+
+        /// <summary>
+        /// If non-null, inspection failed for this EPUB (corrupt ZIP, missing OPF, etc.).
+        /// </summary>
+        public string? Error { get; init; }
+    }
+
+    /// <summary>
+    /// Runs an inspection pass and prints a human-readable report.
+    ///
+    /// Output is intentionally optimized for quick scanning:
+    /// - A compact "All files" list (alphabetical) showing OK/SUSPECT/ERROR.
+    /// - A second "Suspicious files" list (alphabetical) that includes the top reasons.
+    /// </summary>
+    private static void RunInspectionReport(List<string> epubFiles)
+    {
+        // Chosen to be conservative: require at least one high-confidence fingerprint.
+        const int suspiciousThreshold = 5;
+
+        var results = new List<InspectionResult>(capacity: epubFiles.Count);
+        foreach (var epubPath in epubFiles)
+        {
+            results.Add(InspectEpub(epubPath));
+        }
+
+        results.Sort((a, b) => StringComparer.OrdinalIgnoreCase.Compare(Path.GetFileName(a.EpubPath), Path.GetFileName(b.EpubPath)));
+
+        Console.WriteLine();
+        Console.WriteLine("Inspection report (heuristic):");
+        Console.WriteLine(new string('-', 80));
+        Console.WriteLine($"Scanned: {results.Count} file(s)");
+        Console.WriteLine($"Flagged (suspicious): {results.Count(r => r.Error != null || r.Score >= suspiciousThreshold)}");
+        Console.WriteLine(new string('-', 80));
+        Console.WriteLine();
+
+        Console.WriteLine("All files (alphabetical):");
+        foreach (var r in results)
+        {
+            var name = Path.GetFileName(r.EpubPath);
+            if (r.Error != null)
+            {
+                Console.WriteLine($"{name}  [ERROR] {r.Error}");
+            }
+            else if (r.Score >= suspiciousThreshold)
+            {
+                Console.WriteLine($"{name}  [SUSPECT] (score={r.Score})");
+            }
+            else
+            {
+                Console.WriteLine($"{name}  [OK]");
+            }
+        }
+
+        var suspicious = results
+            .Where(r => r.Error != null || r.Score >= suspiciousThreshold)
+            .ToList();
+
+        Console.WriteLine();
+        Console.WriteLine(new string('-', 80));
+        Console.WriteLine($"Suspicious files (alphabetical): {suspicious.Count}");
+        Console.WriteLine(new string('-', 80));
+
+        foreach (var r in suspicious)
+        {
+            var name = Path.GetFileName(r.EpubPath);
+            if (r.Error != null)
+            {
+                Console.WriteLine();
+                Console.WriteLine($"{name}  [ERROR]");
+                Console.WriteLine($"  - {r.Error}");
+                continue;
+            }
+
+            Console.WriteLine();
+            Console.WriteLine($"{name}  (score={r.Score})");
+            foreach (var f in r.Findings
+                .OrderByDescending(f => f.Weight)
+                .ThenBy(f => f.Tool, StringComparer.OrdinalIgnoreCase)
+                .Take(6))
+            {
+                Console.WriteLine($"  - {f.Tool}: {f.Evidence} ({f.Location})");
+            }
+        }
+
+        var toolBreakdown = suspicious
+            .SelectMany(r => r.Findings.Select(f => f.Tool).Distinct(StringComparer.OrdinalIgnoreCase))
+            .GroupBy(t => t, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(g => g.Count())
+            .ThenBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (toolBreakdown.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine(new string('-', 80));
+            Console.WriteLine("Breakdown (flagged files mentioning tool):");
+            foreach (var g in toolBreakdown)
+            {
+                Console.WriteLine($"  {g.Key}: {g.Count()}");
+            }
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("Note: This is heuristic. A fingerprint suggests post-processing, not necessarily “bad” edits.");
+    }
+
+    /// <summary>
+    /// Inspects a single EPUB (ZIP container) and returns a set of fingerprint findings.
+    ///
+    /// This routine is read-only: it does not extract or modify the EPUB. It reads only a
+    /// small subset of internal files needed for fingerprints to keep bulk scans fast.
+    /// </summary>
+    private static InspectionResult InspectEpub(string epubPath)
+    {
+        var findings = new List<InspectionFinding>();
+        try
+        {
+            using var archive = ZipFile.OpenRead(epubPath);
+
+            // container.xml points to the OPF package document (EPUB 2/3).
+            string? containerPath = FindEntryPath(archive, "META-INF/container.xml");
+            if (containerPath == null)
+            {
+                return new InspectionResult { EpubPath = epubPath, Error = "Missing META-INF/container.xml" };
+            }
+
+            var containerText = ReadEntryTextLimited(archive, containerPath, maxBytes: 256 * 1024);
+            var opfPath = TryGetOpfPathFromContainer(containerText);
+            if (string.IsNullOrWhiteSpace(opfPath))
+            {
+                return new InspectionResult { EpubPath = epubPath, Error = "Could not locate OPF path from container.xml" };
+            }
+
+            string? opfEntryPath = FindEntryPath(archive, opfPath);
+            if (opfEntryPath == null)
+            {
+                return new InspectionResult { EpubPath = epubPath, Error = $"OPF not found in archive: {opfPath}" };
+            }
+
+            var opfText = ReadEntryTextLimited(archive, opfEntryPath, maxBytes: 1024 * 1024);
+            AnalyzeOpf(opfText, opfEntryPath, findings);
+
+            // Scan XHTML/CSS (capped) with priority for titlepage-like files.
+            //
+            // Why cap?
+            //   Some EPUBs contain hundreds of resources. We want inspection to remain fast and
+            //   avoid reading megabytes of content per book. Many fingerprints occur in a small
+            //   set of common files (OPF, calibre.css, titlepage.xhtml), so we bias our scan
+            //   toward those first.
+            const int maxEntriesToScan = 30;
+            const int maxBytesPerEntry = 256 * 1024;
+            var candidateEntries = archive.Entries
+                .Where(e => !string.IsNullOrWhiteSpace(e.FullName))
+                .Where(e =>
+                {
+                    var ext = Path.GetExtension(e.FullName).ToLowerInvariant();
+                    return ext is ".xhtml" or ".html" or ".htm" or ".css";
+                })
+                .Where(e =>
+                    !e.FullName.Equals(containerPath, StringComparison.OrdinalIgnoreCase) &&
+                    !e.FullName.Equals(opfEntryPath, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var prioritized = candidateEntries
+                .Select(e => new { Entry = e, Priority = GetInspectPriority(e.FullName) })
+                .OrderBy(x => x.Priority)
+                .ThenBy(x => x.Entry.FullName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var toScan = new List<ZipArchiveEntry>(capacity: Math.Min(maxEntriesToScan, prioritized.Count));
+
+            // Always include "titlepage" priority first; then fill remaining slots.
+            foreach (var x in prioritized)
+            {
+                if (x.Priority == 0)
+                {
+                    toScan.Add(x.Entry);
+                }
+            }
+            foreach (var x in prioritized)
+            {
+                if (toScan.Count >= maxEntriesToScan)
+                {
+                    break;
+                }
+                if (!toScan.Any(e => e.FullName.Equals(x.Entry.FullName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    toScan.Add(x.Entry);
+                }
+            }
+
+            foreach (var entry in toScan)
+            {
+                var text = ReadEntryTextLimited(archive, entry.FullName, maxBytesPerEntry);
+                AnalyzeContentText(text, entry.FullName, findings);
+            }
+
+            // Current scoring model: simple weighted sum of evidence items.
+            // This is intentionally easy to reason about and tweak as new fingerprints are added.
+            int score = findings.Sum(f => f.Weight);
+            return new InspectionResult { EpubPath = epubPath, Score = score, Findings = findings };
+        }
+        catch (InvalidDataException ex)
+        {
+            return new InspectionResult { EpubPath = epubPath, Error = $"Invalid EPUB/ZIP: {ex.Message}" };
+        }
+        catch (Exception ex)
+        {
+            return new InspectionResult { EpubPath = epubPath, Error = $"{ex.GetType().Name}: {ex.Message}" };
+        }
+    }
+
+    private static int GetInspectPriority(string entryName)
+    {
+        // Lower numeric value = scanned earlier.
+        // We always prioritize "titlepage" variants because Calibre/Sigil signatures are often present there.
+        var n = entryName.ToLowerInvariant();
+        if (n.Contains("titlepage") || n.Contains("title-page") || n.Contains("title_page"))
+        {
+            return 0;
+        }
+        if (n.Contains("calibre") || n.Contains("cover") || n.Contains("nav") || n.Contains("toc"))
+        {
+            return 1;
+        }
+        return 2;
+    }
+
+    private static string? FindEntryPath(ZipArchive archive, string desiredPath)
+    {
+        // Most EPUBs are case-sensitive inside the ZIP, but Windows is not. Be tolerant here.
+        var direct = archive.GetEntry(desiredPath);
+        if (direct != null)
+        {
+            return direct.FullName;
+        }
+        // Case-insensitive fallback
+        foreach (var e in archive.Entries)
+        {
+            if (e.FullName.Equals(desiredPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return e.FullName;
+            }
+        }
+        return null;
+    }
+
+    private static string ReadEntryTextLimited(ZipArchive archive, string entryPath, int maxBytes)
+    {
+        // Reads only the first maxBytes bytes to keep scans fast; fingerprints are typically near the top.
+        var entry = archive.GetEntry(entryPath) ?? archive.Entries.First(e => e.FullName.Equals(entryPath, StringComparison.OrdinalIgnoreCase));
+        using var stream = entry.Open();
+        using var ms = new MemoryStream();
+        var buffer = new byte[16 * 1024];
+        int remaining = maxBytes;
+        while (remaining > 0)
+        {
+            int read = stream.Read(buffer, 0, Math.Min(buffer.Length, remaining));
+            if (read <= 0)
+            {
+                break;
+            }
+            ms.Write(buffer, 0, read);
+            remaining -= read;
+        }
+        // Decode as UTF-8 with fallback; we only need rough text scanning.
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private static string? TryGetOpfPathFromContainer(string containerXml)
+    {
+        try
+        {
+            // container.xml is small, so a simple XML parse is fine.
+            var doc = XDocument.Parse(containerXml);
+            var rootfile = doc
+                .Descendants()
+                .FirstOrDefault(e => e.Name.LocalName.Equals("rootfile", StringComparison.OrdinalIgnoreCase));
+            return rootfile?.Attribute("full-path")?.Value;
+        }
+        catch
+        {
+            // Fallback: regex extract full-path="..."
+            var m = Regex.Match(containerXml, "full-path\\s*=\\s*\"(?<p>[^\"]+)\"", RegexOptions.IgnoreCase);
+            return m.Success ? m.Groups["p"].Value : null;
+        }
+    }
+
+    private static void AnalyzeOpf(string opfText, string opfLocation, List<InspectionFinding> findings)
+    {
+        var lower = opfText.ToLowerInvariant();
+
+        // Calibre fingerprints.
+        // Calibre commonly writes "calibre:"-prefixed metadata and may include its namespace URL.
+        if (lower.Contains("https://calibre-ebook.com") || lower.Contains("calibre-ebook.com"))
+        {
+            findings.Add(new InspectionFinding { Tool = "Calibre", Weight = 5, Location = opfLocation, Evidence = "OPF contains calibre-ebook.com prefix/URL" });
+        }
+
+        string[] calibreTokens =
+        {
+            "calibre:series", "calibre:series_index", "calibre:title_sort", "calibre:timestamp", "calibre:user_metadata", "calibre:author_link_map"
+        };
+        foreach (var tok in calibreTokens)
+        {
+            if (lower.Contains(tok))
+            {
+                findings.Add(new InspectionFinding { Tool = "Calibre", Weight = 6, Location = opfLocation, Evidence = $"OPF contains {tok}" });
+                break;
+            }
+        }
+
+        // Generator fingerprints (common place for tool identification).
+        foreach (Match m in Regex.Matches(opfText, "name\\s*=\\s*\"generator\"[^>]*content\\s*=\\s*\"(?<g>[^\"]+)\"", RegexOptions.IgnoreCase))
+        {
+            var g = m.Groups["g"].Value.Trim();
+            if (g.Length == 0) continue;
+            var gl = g.ToLowerInvariant();
+            if (gl.Contains("sigil"))
+            {
+                findings.Add(new InspectionFinding { Tool = "Sigil", Weight = 6, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
+            }
+            else if (gl.Contains("pandoc"))
+            {
+                findings.Add(new InspectionFinding { Tool = "Pandoc", Weight = 6, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
+            }
+            else if (gl.Contains("kindlegen"))
+            {
+                findings.Add(new InspectionFinding { Tool = "KindleGen", Weight = 6, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
+            }
+            else if (gl.Contains("kindle"))
+            {
+                findings.Add(new InspectionFinding { Tool = "Kindle", Weight = 4, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
+            }
+            else if (gl.Contains("adobe") || gl.Contains("indesign"))
+            {
+                findings.Add(new InspectionFinding { Tool = "InDesign/Adobe", Weight = 3, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
+            }
+        }
+    }
+
+    private static void AnalyzeContentText(string text, string location, List<InspectionFinding> findings)
+    {
+        var lower = text.ToLowerInvariant();
+
+        // Calibre XHTML/CSS fingerprints.
+        // Calibre's conversion/templates frequently include a "calibre" class/id/selector.
+        if (lower.Contains("class=\"calibre\"") || lower.Contains("class='calibre'") ||
+            lower.Contains("id=\"calibre") || lower.Contains("id='calibre") ||
+            lower.Contains(".calibre") || lower.Contains("#calibre"))
+        {
+            findings.Add(new InspectionFinding { Tool = "Calibre", Weight = 5, Location = location, Evidence = "XHTML/CSS contains calibre class/id/selector" });
+        }
     }
 
     /// <summary>
@@ -1303,6 +1756,11 @@ internal static class EpubRenamerApp
         /// Author name formatting behavior.
         /// </summary>
         public AuthorFormat AuthorFormat { get; set; } = AuthorFormat.AsIs;
+
+        /// <summary>
+        /// When true, runs in inspection/report-only mode (no rename/copy/move).
+        /// </summary>
+        public bool Inspect { get; set; }
     }
 
     /// <summary>
