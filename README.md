@@ -37,39 +37,39 @@ dotnet build .\EPUBRenamer.sln
 Preview planned renames (no changes made):
 
 ```powershell
-dotnet run -- .\MyEpubFolder
+EPUBRenamer .\MyEpubFolder
 ```
 
 Apply (copy by default) to an output directory:
 
 ```powershell
-dotnet run -- .\MyEpubFolder --apply
+EPUBRenamer .\MyEpubFolder --apply
 ```
 
 Move instead of copy:
 
 ```powershell
-dotnet run -- .\MyEpubFolder --apply --move
+EPUBRenamer .\MyEpubFolder --apply --move
 ```
 
 Recursive scan:
 
 ```powershell
-dotnet run -- .\MyEpubFolder --recursive
+EPUBRenamer .\MyEpubFolder --recursive
 ```
 
 Disable Title Case (Title Case is enabled by default):
 
 ```powershell
-dotnet run -- .\MyEpubFolder --titlecase false
+EPUBRenamer .\MyEpubFolder --titlecase false
 ```
 
 Control author formatting:
 
 ```powershell
-dotnet run -- .\MyEpubFolder --authorformat as-is
-dotnet run -- .\MyEpubFolder --authorformat firstlast
-dotnet run -- .\MyEpubFolder --authorformat lastfirst
+EPUBRenamer .\MyEpubFolder --authorformat as-is
+EPUBRenamer .\MyEpubFolder --authorformat firstlast
+EPUBRenamer .\MyEpubFolder --authorformat lastfirst
 ```
 
 ### Inspect mode (report-only)
@@ -77,13 +77,13 @@ dotnet run -- .\MyEpubFolder --authorformat lastfirst
 Inspect a folder of EPUBs and print a report (no rename/copy/move performed):
 
 ```powershell
-dotnet run -- --inspect .\MyEpubFolder
+EPUBRenamer --inspect .\MyEpubFolder
 ```
 
 Inspect recursively:
 
 ```powershell
-dotnet run -- --inspect .\MyEpubFolder --recursive
+EPUBRenamer --inspect .\MyEpubFolder --recursive
 ```
 
 Notes:
