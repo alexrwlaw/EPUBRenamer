@@ -969,6 +969,21 @@ internal static class EpubRenamerApp
         {
             findings.Add(new InspectionFinding { Tool = "Calibre", Weight = 5, Location = location, Evidence = "XHTML/CSS contains calibre class/id/selector" });
         }
+
+        // Calibre can also stamp XHTML with calibre-specific <meta name="calibre:..."> markers,
+        // commonly used to identify cover/title pages (e.g., calibre:cover).
+        if (lower.Contains("name=\"calibre:") || lower.Contains("name='calibre:"))
+        {
+            // Prefer a more specific hint when we can see a well-known token.
+            if (lower.Contains("name=\"calibre:cover\"") || lower.Contains("name='calibre:cover'"))
+            {
+                findings.Add(new InspectionFinding { Tool = "Calibre", Weight = 5, Location = location, Evidence = "XHTML contains <meta name=\"calibre:cover\" ...>" });
+            }
+            else
+            {
+                findings.Add(new InspectionFinding { Tool = "Calibre", Weight = 4, Location = location, Evidence = "XHTML contains <meta name=\"calibre:*\" ...>" });
+            }
+        }
     }
 
     /// <summary>
