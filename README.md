@@ -86,6 +86,18 @@ Inspect recursively:
 EPUBRenamer --inspect .\MyEpubFolder --recursive
 ```
 
+Sort inspect output by score (most suspicious first):
+
+```powershell
+EPUBRenamer --inspect .\MyEpubFolder --inspect-sort score
+```
+
+Hide metadata-only items in the “Suspicious files” section (show edited/conversion evidence only):
+
+```powershell
+EPUBRenamer --inspect .\MyEpubFolder --inspect-suspicion edited
+```
+
 Notes:
 - `--inspect` is intentionally **incompatible** with apply/rename options. It is a reporting tool to help you identify EPUBs that may have been modified by conversion/editing tools after publication.
 

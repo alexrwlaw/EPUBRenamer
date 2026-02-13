@@ -19,10 +19,14 @@
 //
 // Usage:
 //   dotnet run -- <inputFolder> [--apply] [--move] [--out <outputFolder>] [--recursive] [--ascii [true|false]] [--titlecase [true|false]]
-//   dotnet run -- --inspect <folder> [--recursive]
+//   dotnet run -- --inspect <folder> [--recursive] [--inspect-sort <name|score>] [--inspect-suspicion <edited|any>]
 //
 // Options:
 //   --inspect     Inspect EPUBs and report tool fingerprints (report-only; incompatible with rename/apply options).
+//   --inspect-sort Order inspection output by: name | score (default: name).
+//   --inspect-suspicion Define which files appear in the "Suspicious files" list:
+//                 edited           = only strong evidence of editing/conversion (XHTML/CSS fingerprints, generator tags)
+//                 any (default)    = include metadata-only evidence (e.g., calibre:* OPF tags) as well
 //   --apply       Perform the operations (copy/move). Without this flag, runs as a preview.
 //   --move        Move files instead of copying (copy is the safer default).
 //   --out         Destination folder. Defaults to <inputFolder>\Renamed_<yyyyMMdd_HHmm>.
@@ -106,7 +110,7 @@ internal static class EpubRenamerApp
 
         if (options.Inspect)
         {
-            RunInspectionReport(epubFiles);
+            RunInspectionReport(epubFiles, options);
             return 0;
         }
 
@@ -425,6 +429,8 @@ internal static class EpubRenamerApp
         bool ascii = false; // Unicode by default
         bool titleCase = true; // On by default
         AuthorFormat authorFormat = AuthorFormat.FirstLast; // Default to First Last
+        InspectSort inspectSort = InspectSort.Name;
+        InspectSuspicion inspectSuspicion = InspectSuspicion.Any;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -441,6 +447,30 @@ internal static class EpubRenamerApp
                             return null;
                         }
                         inspectDirectory = args[++i];
+                        break;
+                    case "--inspect-sort":
+                        if (i + 1 >= args.Length)
+                        {
+                            Console.Error.WriteLine("Missing value for --inspect-sort (expected: name | score)");
+                            return null;
+                        }
+                        if (!TryParseInspectSort(args[++i], out inspectSort))
+                        {
+                            Console.Error.WriteLine("Invalid value for --inspect-sort (expected: name | score)");
+                            return null;
+                        }
+                        break;
+                    case "--inspect-suspicion":
+                        if (i + 1 >= args.Length)
+                        {
+                            Console.Error.WriteLine("Missing value for --inspect-suspicion (expected: edited | any)");
+                            return null;
+                        }
+                        if (!TryParseInspectSuspicion(args[++i], out inspectSuspicion))
+                        {
+                            Console.Error.WriteLine("Invalid value for --inspect-suspicion (expected: edited | any)");
+                            return null;
+                        }
                         break;
                     case "--apply":
                         apply = true;
@@ -533,6 +563,15 @@ internal static class EpubRenamerApp
                 return null;
             }
         }
+        else
+        {
+            // If not in inspect mode, reject inspect-only flags to avoid confusion.
+            if (inspectSort != InspectSort.Name || inspectSuspicion != InspectSuspicion.Any)
+            {
+                Console.Error.WriteLine("--inspect-sort/--inspect-suspicion can only be used with --inspect.");
+                return null;
+            }
+        }
 
         if (string.IsNullOrWhiteSpace(inputDirectory))
         {
@@ -549,8 +588,49 @@ internal static class EpubRenamerApp
             Ascii = ascii,
             TitleCase = titleCase,
             AuthorFormat = authorFormat,
-            Inspect = !string.IsNullOrWhiteSpace(inspectDirectory)
+            Inspect = !string.IsNullOrWhiteSpace(inspectDirectory),
+            InspectSort = inspectSort,
+            InspectSuspicion = inspectSuspicion
         };
+    }
+
+    private static bool TryParseInspectSort(string value, out InspectSort sort)
+    {
+        switch (value.Trim().ToLowerInvariant())
+        {
+            case "name":
+            case "filename":
+            case "alpha":
+                sort = InspectSort.Name;
+                return true;
+            case "score":
+            case "suspicious":
+            case "suspicion":
+                sort = InspectSort.Score;
+                return true;
+            default:
+                sort = InspectSort.Name;
+                return false;
+        }
+    }
+
+    private static bool TryParseInspectSuspicion(string value, out InspectSuspicion suspicion)
+    {
+        switch (value.Trim().ToLowerInvariant())
+        {
+            case "edited":
+            case "edit":
+            case "strong":
+                suspicion = InspectSuspicion.Edited;
+                return true;
+            case "any":
+            case "all":
+                suspicion = InspectSuspicion.Any;
+                return true;
+            default:
+                suspicion = InspectSuspicion.Edited;
+                return false;
+        }
     }
 
     /// <summary>
@@ -560,7 +640,7 @@ internal static class EpubRenamerApp
     {
         Console.WriteLine("Usage:");
         Console.WriteLine("  dotnet run -- <inputFolder> [--apply] [--move] [--out <outputFolder>] [--recursive] [--ascii [true|false]] [--titlecase [true|false]] [--authorformat <as-is|firstlast|lastfirst>]");
-        Console.WriteLine("  dotnet run -- --inspect <folder> [--recursive]");
+        Console.WriteLine("  dotnet run -- --inspect <folder> [--recursive] [--inspect-sort <name|score>] [--inspect-suspicion <edited|any>]");
         Console.WriteLine();
         Console.WriteLine("Defaults:");
         Console.WriteLine("  - Unicode filenames (no ASCII stripping).");
@@ -569,6 +649,34 @@ internal static class EpubRenamerApp
         Console.WriteLine("  - Author joiner: comma \", \".");
         Console.WriteLine("  - Title Case enabled (use --titlecase false to disable).");
         Console.WriteLine("  - Author format: firstlast (use --authorformat as-is to disable).");
+        Console.WriteLine("  - Inspect sort: name (use --inspect-sort score to sort by suspicion).");
+        Console.WriteLine("  - Inspect suspicious list: any (use --inspect-suspicion edited to hide metadata-only evidence).");
+    }
+
+    private enum InspectSort
+    {
+        Name,
+        Score
+    }
+
+    private enum InspectSuspicion
+    {
+        Edited,
+        Any
+    }
+
+    private enum FingerprintKind
+    {
+        Metadata,
+        Content,
+        Generator
+    }
+
+    private enum InspectionClassification
+    {
+        Ok,
+        MetadataOnly,
+        Edited
     }
 
     /// <summary>
@@ -585,6 +693,11 @@ internal static class EpubRenamerApp
         /// A relative weight used for scoring. Higher weights indicate stronger evidence.
         /// </summary>
         public int Weight { get; init; }
+
+        /// <summary>
+        /// Broad category used to distinguish "metadata-only" evidence from "edited/conversion" evidence.
+        /// </summary>
+        public FingerprintKind Kind { get; init; }
 
         /// <summary>
         /// Where the fingerprint was found (path inside the EPUB archive).
@@ -618,6 +731,11 @@ internal static class EpubRenamerApp
         public List<InspectionFinding> Findings { get; init; } = new();
 
         /// <summary>
+        /// Coarse classification derived from findings. Used for human-friendly reporting.
+        /// </summary>
+        public InspectionClassification Classification { get; init; }
+
+        /// <summary>
         /// If non-null, inspection failed for this EPUB (corrupt ZIP, missing OPF, etc.).
         /// </summary>
         public string? Error { get; init; }
@@ -630,38 +748,39 @@ internal static class EpubRenamerApp
     /// - A compact "All files" list (alphabetical) showing OK/SUSPECT/ERROR.
     /// - A second "Suspicious files" list (alphabetical) that includes the top reasons.
     /// </summary>
-    private static void RunInspectionReport(List<string> epubFiles)
+    private static void RunInspectionReport(List<string> epubFiles, Options options)
     {
-        // Chosen to be conservative: require at least one high-confidence fingerprint.
-        const int suspiciousThreshold = 5;
-
         var results = new List<InspectionResult>(capacity: epubFiles.Count);
         foreach (var epubPath in epubFiles)
         {
             results.Add(InspectEpub(epubPath));
         }
 
-        results.Sort((a, b) => StringComparer.OrdinalIgnoreCase.Compare(Path.GetFileName(a.EpubPath), Path.GetFileName(b.EpubPath)));
+        var allSorted = SortInspectionResults(results, options.InspectSort);
 
         Console.WriteLine();
         Console.WriteLine("Inspection report (heuristic):");
         Console.WriteLine(new string('-', 80));
         Console.WriteLine($"Scanned: {results.Count} file(s)");
-        Console.WriteLine($"Flagged (suspicious): {results.Count(r => r.Error != null || r.Score >= suspiciousThreshold)}");
+        Console.WriteLine($"Flagged (suspicious): {GetSuspiciousResults(results, options.InspectSuspicion).Count}");
         Console.WriteLine(new string('-', 80));
         Console.WriteLine();
 
         Console.WriteLine("All files (alphabetical):");
-        foreach (var r in results)
+        foreach (var r in allSorted)
         {
             var name = Path.GetFileName(r.EpubPath);
             if (r.Error != null)
             {
                 Console.WriteLine($"{name}  [ERROR] {r.Error}");
             }
-            else if (r.Score >= suspiciousThreshold)
+            else if (r.Classification == InspectionClassification.Edited)
             {
-                Console.WriteLine($"{name}  [SUSPECT] (score={r.Score})");
+                Console.WriteLine($"{name}  [EDITED] (score={r.Score})");
+            }
+            else if (r.Classification == InspectionClassification.MetadataOnly)
+            {
+                Console.WriteLine($"{name}  [METADATA] (score={r.Score})");
             }
             else
             {
@@ -669,16 +788,15 @@ internal static class EpubRenamerApp
             }
         }
 
-        var suspicious = results
-            .Where(r => r.Error != null || r.Score >= suspiciousThreshold)
-            .ToList();
+        var suspicious = GetSuspiciousResults(results, options.InspectSuspicion);
+        var suspiciousSorted = SortInspectionResults(suspicious, options.InspectSort);
 
         Console.WriteLine();
         Console.WriteLine(new string('-', 80));
-        Console.WriteLine($"Suspicious files (alphabetical): {suspicious.Count}");
+        Console.WriteLine($"Suspicious files ({(options.InspectSort == InspectSort.Score ? "by score" : "alphabetical")}): {suspicious.Count}");
         Console.WriteLine(new string('-', 80));
 
-        foreach (var r in suspicious)
+        foreach (var r in suspiciousSorted)
         {
             var name = Path.GetFileName(r.EpubPath);
             if (r.Error != null)
@@ -690,7 +808,7 @@ internal static class EpubRenamerApp
             }
 
             Console.WriteLine();
-            Console.WriteLine($"{name}  (score={r.Score})");
+            Console.WriteLine($"{name}  [{(r.Classification == InspectionClassification.Edited ? "EDITED" : "METADATA")}] (score={r.Score})");
             foreach (var f in r.Findings
                 .OrderByDescending(f => f.Weight)
                 .ThenBy(f => f.Tool, StringComparer.OrdinalIgnoreCase)
@@ -720,6 +838,41 @@ internal static class EpubRenamerApp
 
         Console.WriteLine();
         Console.WriteLine("Note: This is heuristic. A fingerprint suggests post-processing, not necessarily “bad” edits.");
+    }
+
+    private static List<InspectionResult> GetSuspiciousResults(List<InspectionResult> results, InspectSuspicion suspicion)
+    {
+        return results
+            .Where(r =>
+                r.Error != null ||
+                r.Classification == InspectionClassification.Edited ||
+                (suspicion == InspectSuspicion.Any && r.Classification == InspectionClassification.MetadataOnly))
+            .ToList();
+    }
+
+    private static List<InspectionResult> SortInspectionResults(List<InspectionResult> results, InspectSort sort)
+    {
+        int Rank(InspectionResult r)
+        {
+            if (r.Error != null) return 0;
+            if (r.Classification == InspectionClassification.Edited) return 1;
+            if (r.Classification == InspectionClassification.MetadataOnly) return 2;
+            return 3;
+        }
+
+        if (sort == InspectSort.Score)
+        {
+            return results
+                .OrderBy(Rank)
+                .ThenByDescending(r => r.Score)
+                .ThenBy(r => Path.GetFileName(r.EpubPath), StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        // Default: sort by filename for easy lookups.
+        return results
+            .OrderBy(r => Path.GetFileName(r.EpubPath), StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 
     /// <summary>
@@ -816,7 +969,19 @@ internal static class EpubRenamerApp
             // Current scoring model: simple weighted sum of evidence items.
             // This is intentionally easy to reason about and tweak as new fingerprints are added.
             int score = findings.Sum(f => f.Weight);
-            return new InspectionResult { EpubPath = epubPath, Score = score, Findings = findings };
+
+            // Classification: distinguish "metadata-only" hints from stronger "edited/conversion" hints.
+            // Rationale:
+            //   It is common to see Calibre-specific OPF metadata (series, title_sort, etc.) simply because
+            //   a book was managed/exported from a library. Stronger evidence of post-processing tends to
+            //   show up in content files (class="calibre", calibre:cover meta, etc.) or explicit generator tags.
+            bool hasEditedEvidence = findings.Any(f => f.Kind is FingerprintKind.Content or FingerprintKind.Generator);
+            bool hasMetadataEvidence = findings.Any(f => f.Kind == FingerprintKind.Metadata);
+            var classification = hasEditedEvidence
+                ? InspectionClassification.Edited
+                : hasMetadataEvidence ? InspectionClassification.MetadataOnly : InspectionClassification.Ok;
+
+            return new InspectionResult { EpubPath = epubPath, Score = score, Findings = findings, Classification = classification };
         }
         catch (InvalidDataException ex)
         {
@@ -912,7 +1077,8 @@ internal static class EpubRenamerApp
         // Calibre commonly writes "calibre:"-prefixed metadata and may include its namespace URL.
         if (lower.Contains("https://calibre-ebook.com") || lower.Contains("calibre-ebook.com"))
         {
-            findings.Add(new InspectionFinding { Tool = "Calibre", Weight = 5, Location = opfLocation, Evidence = "OPF contains calibre-ebook.com prefix/URL" });
+            // Weak-to-moderate signal: can appear from metadata edits/export without full conversion.
+            findings.Add(new InspectionFinding { Tool = "Calibre", Kind = FingerprintKind.Metadata, Weight = 2, Location = opfLocation, Evidence = "OPF contains calibre-ebook.com prefix/URL" });
         }
 
         string[] calibreTokens =
@@ -923,7 +1089,9 @@ internal static class EpubRenamerApp
         {
             if (lower.Contains(tok))
             {
-                findings.Add(new InspectionFinding { Tool = "Calibre", Weight = 6, Location = opfLocation, Evidence = $"OPF contains {tok}" });
+                // Treat as "metadata-only" evidence. This often indicates library-managed/exported EPUBs,
+                // not necessarily heavy content conversion.
+                findings.Add(new InspectionFinding { Tool = "Calibre", Kind = FingerprintKind.Metadata, Weight = 3, Location = opfLocation, Evidence = $"OPF contains {tok}" });
                 break;
             }
         }
@@ -936,23 +1104,24 @@ internal static class EpubRenamerApp
             var gl = g.ToLowerInvariant();
             if (gl.Contains("sigil"))
             {
-                findings.Add(new InspectionFinding { Tool = "Sigil", Weight = 6, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
+                findings.Add(new InspectionFinding { Tool = "Sigil", Kind = FingerprintKind.Generator, Weight = 8, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
             }
             else if (gl.Contains("pandoc"))
             {
-                findings.Add(new InspectionFinding { Tool = "Pandoc", Weight = 6, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
+                findings.Add(new InspectionFinding { Tool = "Pandoc", Kind = FingerprintKind.Generator, Weight = 8, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
             }
             else if (gl.Contains("kindlegen"))
             {
-                findings.Add(new InspectionFinding { Tool = "KindleGen", Weight = 6, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
+                findings.Add(new InspectionFinding { Tool = "KindleGen", Kind = FingerprintKind.Generator, Weight = 7, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
             }
             else if (gl.Contains("kindle"))
             {
-                findings.Add(new InspectionFinding { Tool = "Kindle", Weight = 4, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
+                findings.Add(new InspectionFinding { Tool = "Kindle", Kind = FingerprintKind.Generator, Weight = 5, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
             }
             else if (gl.Contains("adobe") || gl.Contains("indesign"))
             {
-                findings.Add(new InspectionFinding { Tool = "InDesign/Adobe", Weight = 3, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
+                // InDesign is commonly a "publisher pipeline" tool; we still report it, but it is not our primary suspicion target.
+                findings.Add(new InspectionFinding { Tool = "InDesign/Adobe", Kind = FingerprintKind.Generator, Weight = 2, Location = opfLocation, Evidence = $"generator=\"{g}\"" });
             }
         }
     }
@@ -967,7 +1136,8 @@ internal static class EpubRenamerApp
             lower.Contains("id=\"calibre") || lower.Contains("id='calibre") ||
             lower.Contains(".calibre") || lower.Contains("#calibre"))
         {
-            findings.Add(new InspectionFinding { Tool = "Calibre", Weight = 5, Location = location, Evidence = "XHTML/CSS contains calibre class/id/selector" });
+            // Stronger signal: usually introduced by conversion/templates rather than simple metadata export.
+            findings.Add(new InspectionFinding { Tool = "Calibre", Kind = FingerprintKind.Content, Weight = 7, Location = location, Evidence = "XHTML/CSS contains calibre class/id/selector" });
         }
 
         // Calibre can also stamp XHTML with calibre-specific <meta name="calibre:..."> markers,
@@ -977,11 +1147,11 @@ internal static class EpubRenamerApp
             // Prefer a more specific hint when we can see a well-known token.
             if (lower.Contains("name=\"calibre:cover\"") || lower.Contains("name='calibre:cover'"))
             {
-                findings.Add(new InspectionFinding { Tool = "Calibre", Weight = 5, Location = location, Evidence = "XHTML contains <meta name=\"calibre:cover\" ...>" });
+                findings.Add(new InspectionFinding { Tool = "Calibre", Kind = FingerprintKind.Content, Weight = 6, Location = location, Evidence = "XHTML contains <meta name=\"calibre:cover\" ...>" });
             }
             else
             {
-                findings.Add(new InspectionFinding { Tool = "Calibre", Weight = 4, Location = location, Evidence = "XHTML contains <meta name=\"calibre:*\" ...>" });
+                findings.Add(new InspectionFinding { Tool = "Calibre", Kind = FingerprintKind.Content, Weight = 5, Location = location, Evidence = "XHTML contains <meta name=\"calibre:*\" ...>" });
             }
         }
     }
@@ -1776,6 +1946,16 @@ internal static class EpubRenamerApp
         /// When true, runs in inspection/report-only mode (no rename/copy/move).
         /// </summary>
         public bool Inspect { get; set; }
+
+        /// <summary>
+        /// Controls ordering of inspect output (by filename or by suspicion score).
+        /// </summary>
+        public InspectSort InspectSort { get; set; } = InspectSort.Name;
+
+        /// <summary>
+        /// Controls what appears in the "Suspicious files" list for inspect mode.
+        /// </summary>
+        public InspectSuspicion InspectSuspicion { get; set; } = InspectSuspicion.Any;
     }
 
     /// <summary>
