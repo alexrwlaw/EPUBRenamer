@@ -721,6 +721,26 @@ internal static class EpubRenamerApp
         public string EpubPath { get; init; } = string.Empty;
 
         /// <summary>
+        /// Filesystem last-write timestamp for the EPUB on disk.
+        /// </summary>
+        public DateTime FileLastWriteTime { get; init; }
+
+        /// <summary>
+        /// The OPF package's modified timestamp (typically dcterms:modified) when present.
+        /// This is metadata inside the EPUB, and may not match the on-disk timestamp.
+        /// </summary>
+        public string? OpfModified { get; init; }
+
+        /// <summary>
+        /// Calibre-specific timestamp when present. This is not part of the EPUB standard,
+        /// but it can be a useful indicator that Calibre wrote or polished the package.
+        /// Common forms include:
+        /// - EPUB2 style: <meta name="calibre:timestamp" content="..."/>
+        /// - EPUB3 style: <meta property="calibre:timestamp" scheme="dcterms:W3CDTF">...</meta>
+        /// </summary>
+        public string? CalibreTimestamp { get; init; }
+
+        /// <summary>
         /// Sum of all finding weights. This is a heuristic score, not a probability.
         /// </summary>
         public int Score { get; init; }
@@ -770,21 +790,22 @@ internal static class EpubRenamerApp
         foreach (var r in allSorted)
         {
             var name = Path.GetFileName(r.EpubPath);
+            var fileStamp = r.FileLastWriteTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
             if (r.Error != null)
             {
-                Console.WriteLine($"{name}  [ERROR] {r.Error}");
+                Console.WriteLine($"{name}  [ERROR] file={fileStamp}  {r.Error}");
             }
             else if (r.Classification == InspectionClassification.Edited)
             {
-                Console.WriteLine($"{name}  [EDITED] (score={r.Score})");
+                Console.WriteLine($"{name}  [EDITED] (score={r.Score}) file={fileStamp}");
             }
             else if (r.Classification == InspectionClassification.MetadataOnly)
             {
-                Console.WriteLine($"{name}  [METADATA] (score={r.Score})");
+                Console.WriteLine($"{name}  [METADATA] (score={r.Score}) file={fileStamp}");
             }
             else
             {
-                Console.WriteLine($"{name}  [OK]");
+                Console.WriteLine($"{name}  [OK] file={fileStamp}");
             }
         }
 
@@ -809,6 +830,15 @@ internal static class EpubRenamerApp
 
             Console.WriteLine();
             Console.WriteLine($"{name}  [{(r.Classification == InspectionClassification.Edited ? "EDITED" : "METADATA")}] (score={r.Score})");
+            Console.WriteLine($"  - File last modified: {r.FileLastWriteTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)}");
+            if (!string.IsNullOrWhiteSpace(r.OpfModified))
+            {
+                Console.WriteLine($"  - OPF dcterms:modified: {r.OpfModified}");
+            }
+            if (!string.IsNullOrWhiteSpace(r.CalibreTimestamp))
+            {
+                Console.WriteLine($"  - OPF calibre:timestamp: {r.CalibreTimestamp}");
+            }
             foreach (var f in r.Findings
                 .OrderByDescending(f => f.Weight)
                 .ThenBy(f => f.Tool, StringComparer.OrdinalIgnoreCase)
@@ -887,28 +917,33 @@ internal static class EpubRenamerApp
         try
         {
             using var archive = ZipFile.OpenRead(epubPath);
+            var fileLastWriteTime = File.GetLastWriteTime(epubPath);
+            string? opfModified = null;
+            string? calibreTimestamp = null;
 
             // container.xml points to the OPF package document (EPUB 2/3).
             string? containerPath = FindEntryPath(archive, "META-INF/container.xml");
             if (containerPath == null)
             {
-                return new InspectionResult { EpubPath = epubPath, Error = "Missing META-INF/container.xml" };
+                return new InspectionResult { EpubPath = epubPath, FileLastWriteTime = fileLastWriteTime, Error = "Missing META-INF/container.xml" };
             }
 
             var containerText = ReadEntryTextLimited(archive, containerPath, maxBytes: 256 * 1024);
             var opfPath = TryGetOpfPathFromContainer(containerText);
             if (string.IsNullOrWhiteSpace(opfPath))
             {
-                return new InspectionResult { EpubPath = epubPath, Error = "Could not locate OPF path from container.xml" };
+                return new InspectionResult { EpubPath = epubPath, FileLastWriteTime = fileLastWriteTime, Error = "Could not locate OPF path from container.xml" };
             }
 
             string? opfEntryPath = FindEntryPath(archive, opfPath);
             if (opfEntryPath == null)
             {
-                return new InspectionResult { EpubPath = epubPath, Error = $"OPF not found in archive: {opfPath}" };
+                return new InspectionResult { EpubPath = epubPath, FileLastWriteTime = fileLastWriteTime, Error = $"OPF not found in archive: {opfPath}" };
             }
 
             var opfText = ReadEntryTextLimited(archive, opfEntryPath, maxBytes: 1024 * 1024);
+            opfModified = TryExtractOpfModified(opfText);
+            calibreTimestamp = TryExtractCalibreTimestamp(opfText);
             AnalyzeOpf(opfText, opfEntryPath, findings);
 
             // Scan XHTML/CSS (capped) with priority for titlepage-like files.
@@ -981,15 +1016,102 @@ internal static class EpubRenamerApp
                 ? InspectionClassification.Edited
                 : hasMetadataEvidence ? InspectionClassification.MetadataOnly : InspectionClassification.Ok;
 
-            return new InspectionResult { EpubPath = epubPath, Score = score, Findings = findings, Classification = classification };
+            return new InspectionResult
+            {
+                EpubPath = epubPath,
+                FileLastWriteTime = fileLastWriteTime,
+                OpfModified = opfModified,
+                CalibreTimestamp = calibreTimestamp,
+                Score = score,
+                Findings = findings,
+                Classification = classification
+            };
         }
         catch (InvalidDataException ex)
         {
-            return new InspectionResult { EpubPath = epubPath, Error = $"Invalid EPUB/ZIP: {ex.Message}" };
+            return new InspectionResult { EpubPath = epubPath, FileLastWriteTime = File.GetLastWriteTime(epubPath), Error = $"Invalid EPUB/ZIP: {ex.Message}" };
         }
         catch (Exception ex)
         {
-            return new InspectionResult { EpubPath = epubPath, Error = $"{ex.GetType().Name}: {ex.Message}" };
+            return new InspectionResult { EpubPath = epubPath, FileLastWriteTime = File.GetLastWriteTime(epubPath), Error = $"{ex.GetType().Name}: {ex.Message}" };
+        }
+    }
+
+    private static string? TryExtractOpfModified(string opfText)
+    {
+        // EPUB3 typically stores this as: <meta property="dcterms:modified">2012-01-01T00:00:00Z</meta>
+        // Be resilient to namespaces and minor variations; this is informational only.
+        try
+        {
+            var doc = XDocument.Parse(opfText);
+            var meta = doc.Descendants()
+                .FirstOrDefault(e =>
+                    e.Name.LocalName.Equals("meta", StringComparison.OrdinalIgnoreCase) &&
+                    (e.Attribute("property")?.Value?.Equals("dcterms:modified", StringComparison.OrdinalIgnoreCase) ?? false));
+            var val = (meta?.Value ?? string.Empty).Trim();
+            return string.IsNullOrWhiteSpace(val) ? null : val;
+        }
+        catch
+        {
+            // Regex fallback: match property="dcterms:modified">...</meta>
+            var m = Regex.Match(opfText, "property\\s*=\\s*\"dcterms:modified\"[^>]*>\\s*(?<v>[^<]+)\\s*<\\s*/\\s*meta\\s*>", RegexOptions.IgnoreCase);
+            if (m.Success)
+            {
+                var v = m.Groups["v"].Value.Trim();
+                return string.IsNullOrWhiteSpace(v) ? null : v;
+            }
+            return null;
+        }
+    }
+
+    private static string? TryExtractCalibreTimestamp(string opfText)
+    {
+        // Calibre can store a timestamp in multiple forms depending on EPUB version and tooling:
+        // - EPUB2-ish: <meta name="calibre:timestamp" content="2012-01-01T00:00:00Z" />
+        // - EPUB3-ish: <meta property="calibre:timestamp" scheme="dcterms:W3CDTF">2012-01-01T00:00:00Z</meta>
+        //
+        // We treat this as informational. Presence suggests Calibre wrote/polished metadata.
+        try
+        {
+            var doc = XDocument.Parse(opfText);
+
+            // EPUB3-ish (property)
+            var propMeta = doc.Descendants()
+                .FirstOrDefault(e =>
+                    e.Name.LocalName.Equals("meta", StringComparison.OrdinalIgnoreCase) &&
+                    (e.Attribute("property")?.Value?.Equals("calibre:timestamp", StringComparison.OrdinalIgnoreCase) ?? false));
+            var propVal = (propMeta?.Value ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(propVal))
+            {
+                return propVal;
+            }
+
+            // EPUB2-ish (name/content)
+            var nameMeta = doc.Descendants()
+                .FirstOrDefault(e =>
+                    e.Name.LocalName.Equals("meta", StringComparison.OrdinalIgnoreCase) &&
+                    (e.Attribute("name")?.Value?.Equals("calibre:timestamp", StringComparison.OrdinalIgnoreCase) ?? false));
+            var content = (nameMeta?.Attribute("content")?.Value ?? string.Empty).Trim();
+            return string.IsNullOrWhiteSpace(content) ? null : content;
+        }
+        catch
+        {
+            // Regex fallbacks
+            var m1 = Regex.Match(opfText, "property\\s*=\\s*\"calibre:timestamp\"[^>]*>\\s*(?<v>[^<]+)\\s*<\\s*/\\s*meta\\s*>", RegexOptions.IgnoreCase);
+            if (m1.Success)
+            {
+                var v = m1.Groups["v"].Value.Trim();
+                if (!string.IsNullOrWhiteSpace(v)) return v;
+            }
+
+            var m2 = Regex.Match(opfText, "name\\s*=\\s*\"calibre:timestamp\"[^>]*content\\s*=\\s*\"(?<v>[^\"]+)\"", RegexOptions.IgnoreCase);
+            if (m2.Success)
+            {
+                var v = m2.Groups["v"].Value.Trim();
+                if (!string.IsNullOrWhiteSpace(v)) return v;
+            }
+
+            return null;
         }
     }
 
