@@ -960,7 +960,7 @@ internal static class EpubRenamerApp
                 .Where(e =>
                 {
                     var ext = Path.GetExtension(e.FullName).ToLowerInvariant();
-                    return ext is ".xhtml" or ".html" or ".htm" or ".css";
+                    return ext is ".xhtml" or ".html" or ".htm" or ".css" or ".ncx";
                 })
                 .Where(e =>
                     !e.FullName.Equals(containerPath, StringComparison.OrdinalIgnoreCase) &&
@@ -1274,6 +1274,37 @@ internal static class EpubRenamerApp
             else
             {
                 findings.Add(new InspectionFinding { Tool = "Calibre", Kind = FingerprintKind.Content, Weight = 5, Location = location, Evidence = "XHTML contains <meta name=\"calibre:*\" ...>" });
+            }
+        }
+
+        // EPUB2 navigation files (NCX) often include a generator marker:
+        //   <meta name="dtb:generator" content="calibre (2.56.0)"/>
+        // This is strong evidence of conversion/editing rather than a minor metadata tweak.
+        if (lower.Contains("name=\"dtb:generator\"") || lower.Contains("name='dtb:generator'"))
+        {
+            var m = Regex.Match(text, "name\\s*=\\s*\"dtb:generator\"[^>]*content\\s*=\\s*\"(?<v>[^\"]+)\"", RegexOptions.IgnoreCase);
+            if (!m.Success)
+            {
+                m = Regex.Match(text, "name\\s*=\\s*'dtb:generator'[^>]*content\\s*=\\s*'(?<v>[^']+)'", RegexOptions.IgnoreCase);
+            }
+
+            var v = m.Success ? m.Groups["v"].Value.Trim() : string.Empty;
+            var vl = v.ToLowerInvariant();
+            if (vl.Contains("calibre"))
+            {
+                findings.Add(new InspectionFinding { Tool = "Calibre", Kind = FingerprintKind.Generator, Weight = 7, Location = location, Evidence = $"NCX dtb:generator=\"{v}\"" });
+            }
+            else if (vl.Contains("sigil"))
+            {
+                findings.Add(new InspectionFinding { Tool = "Sigil", Kind = FingerprintKind.Generator, Weight = 7, Location = location, Evidence = $"NCX dtb:generator=\"{v}\"" });
+            }
+            else if (!string.IsNullOrWhiteSpace(v))
+            {
+                findings.Add(new InspectionFinding { Tool = "Generator", Kind = FingerprintKind.Generator, Weight = 5, Location = location, Evidence = $"NCX dtb:generator=\"{v}\"" });
+            }
+            else
+            {
+                findings.Add(new InspectionFinding { Tool = "Generator", Kind = FingerprintKind.Generator, Weight = 4, Location = location, Evidence = "NCX contains dtb:generator meta" });
             }
         }
     }

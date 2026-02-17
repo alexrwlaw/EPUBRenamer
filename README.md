@@ -100,4 +100,6 @@ EPUBRenamer --inspect .\MyEpubFolder --inspect-suspicion edited
 
 Notes:
 - `--inspect` is intentionally **incompatible** with apply/rename options. It is a reporting tool to help you identify EPUBs that may have been modified by conversion/editing tools after publication.
+- By default, `--inspect` includes both metadata-only and edited/conversion findings in the “Suspicious files” section (use `--inspect-suspicion edited` to hide metadata-only).
+- The report includes each EPUB’s on-disk last modified timestamp, and may also show OPF timestamps (for example, `dcterms:modified` and Calibre’s `calibre:timestamp`) when present.
 
